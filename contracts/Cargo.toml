@@ -6,6 +6,7 @@ members = [
     "staking",
     "escrow",
     "amm_pool",
+    "dao_governance",
 ]
 
 [profile.release]

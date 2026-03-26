@@ -24,6 +24,7 @@ app.use('/api/auth', authRateLimiter);
 app.use('/api/docs', require('./routes/docs.routes'));
 app.use('/api/triggers', require('./routes/trigger.routes'));
 app.use('/api/stats', require('./routes/stats.routes'));
+app.use('/api/queue', require('./routes/queue.routes'));
 /**
  * @openapi
  * /api/health:
