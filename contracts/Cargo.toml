@@ -1,11 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
+    "airdrop",
     "boilerplate",
     "token_vesting",
     "staking",
     "escrow",
     "amm_pool",
+    "dao_governance",
+    "lending_base",
 ]
 
 [profile.release]
