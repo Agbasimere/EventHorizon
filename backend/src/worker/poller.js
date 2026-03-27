@@ -1,31 +1,171 @@
-const { rpc, Transaction, xdr } = require('@stellar/stellar-sdk');
+const { rpc, xdr } = require('@stellar/stellar-sdk');
 const Trigger = require('../models/trigger.model');
 const axios = require('axios');
+const { sendEventNotification } = require('../services/email.service');
+const slackService = require('../services/slack.service');
+const telegramService = require('../services/telegram.service');
 
 const RPC_URL = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
-const server = new rpc.Server(RPC_URL);
+const server = new rpc.Server(RPC_URL, {
+    timeout: parseInt(process.env.RPC_TIMEOUT_MS || '10000', 10),
+});
 
-// Prevent requesting too many ledgers at once and angering the RPC node
+const logger = require('../config/logger');
+
+// --- Configuration ---
 const MAX_LEDGERS_PER_POLL = parseInt(process.env.MAX_LEDGERS_PER_POLL || '10000', 10);
+const RPC_MAX_RETRIES = parseInt(process.env.RPC_MAX_RETRIES || '3', 10);
+const RPC_BASE_DELAY_MS = parseInt(process.env.RPC_BASE_DELAY_MS || '1000', 10);
+const INTER_TRIGGER_DELAY_MS = parseInt(process.env.INTER_TRIGGER_DELAY_MS || '100', 10);
+const INTER_PAGE_DELAY_MS = parseInt(process.env.INTER_PAGE_DELAY_MS || '200', 10);
+
+// --- Utility Functions ---
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Retries an async function with exponential backoff.
+ * Retries on network errors, 429 (rate limit), and 5xx server errors.
+ */
+async function withRetry(fn, { maxRetries = RPC_MAX_RETRIES, baseDelay = RPC_BASE_DELAY_MS } = {}) {
+    let lastError;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (error) {
+            lastError = error;
+            const status = error?.response?.status || error?.status;
+            const isRetryable = !status || status === 429 || status >= 500
+                || error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT';
+
+            if (!isRetryable || attempt === maxRetries) {
+                throw error;
+            }
+
+            // Exponential backoff: 1s, 2s, 4s ...
+            const delay = baseDelay * Math.pow(2, attempt);
+            logger.warn(`RPC request failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${delay}ms`, {
+                error: error.message,
+                status,
+            });
+            await sleep(delay);
+        }
+    }
+    throw lastError;
+}
+
+// --- Action Execution ---
+
+async function executeTriggerAction(trigger, eventPayload) {
+    switch (trigger.actionType) {
+        case 'email': {
+            return sendEventNotification({
+                trigger,
+                payload: eventPayload,
+            });
+        }
+        case 'webhook': {
+            if (!trigger.actionUrl) {
+                throw new Error('Missing actionUrl for webhook trigger');
+            }
+            return axios.post(trigger.actionUrl, {
+                contractId: trigger.contractId,
+                eventName: trigger.eventName,
+                payload: eventPayload,
+            });
+        }
+        case 'discord': {
+            if (!trigger.actionUrl) {
+                throw new Error('Missing actionUrl for discord trigger');
+            }
+            return axios.post(trigger.actionUrl, {
+                contractId: trigger.contractId,
+                eventName: trigger.eventName,
+                payload: eventPayload,
+            });
+        }
+        case 'slack': {
+            return slackService.execute(trigger, eventPayload);
+        }
+        case 'telegram': {
+            const botToken = process.env.TELEGRAM_BOT_TOKEN;
+            const chatId = trigger.actionUrl; // actionUrl stores the chat ID for telegram triggers
+            if (!botToken || !chatId) {
+                throw new Error('Missing TELEGRAM_BOT_TOKEN or actionUrl (chatId) for telegram trigger');
+            }
+            const text = [
+                '🔔 *EventHorizon Alert*',
+                '',
+                `*Event:* ${telegramService.escapeMarkdownV2(trigger.eventName)}`,
+                `*Contract:* \`${telegramService.escapeMarkdownV2(trigger.contractId)}\``,
+                '',
+                `\`\`\`json`,
+                telegramService.escapeMarkdownV2(JSON.stringify(eventPayload, null, 2)),
+                `\`\`\``,
+            ].join('\n');
+            return telegramService.sendTelegramMessage(botToken, chatId, text);
+        }
+        default:
+            throw new Error(`Unsupported action type: ${trigger.actionType}`);
+    }
+}
+
+/**
+ * Executes a trigger action with retry support using the trigger's retryConfig.
+ */
+async function executeWithRetry(trigger, eventPayload) {
+    const maxRetries = trigger.retryConfig?.maxRetries ?? 3;
+    const retryInterval = trigger.retryConfig?.retryIntervalMs ?? 5000;
+
+    let lastError;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            await executeTriggerAction(trigger, eventPayload);
+            return { success: true };
+        } catch (error) {
+            lastError = error;
+            if (attempt < maxRetries) {
+                logger.warn(`Action failed for trigger ${trigger._id} (attempt ${attempt + 1}/${maxRetries + 1}), retrying...`, {
+                    error: error.message,
+                    actionType: trigger.actionType,
+                });
+                await sleep(retryInterval);
+            }
+        }
+    }
+    return { success: false, error: lastError };
+}
+
+// --- Core Polling Logic ---
 
 async function pollEvents() {
     try {
         const triggers = await Trigger.find({ isActive: true });
-        if (triggers.length === 0) return;
+
+        if (triggers.length === 0) {
+            logger.debug('No active triggers found for polling');
+            return;
+        }
+
+        logger.info('Starting event polling cycle', {
+            activeTriggers: triggers.length,
+            rpcUrl: RPC_URL
+        });
 
         // 1. Get the current network tip to cap our sliding window
         let latestLedgerSequence = 0;
         try {
-            const latest = await server.getLatestLedger();
+            const latest = await withRetry(() => server.getLatestLedger());
             latestLedgerSequence = latest.sequence;
         } catch (e) {
-            console.error('⚠️ Failed to get latest ledger from RPC:', e.message);
+            logger.error('Failed to get latest ledger from RPC after retries:', { error: e.message });
             return;
         }
 
         for (const trigger of triggers) {
-            console.log(`🔍 Polling for: ${trigger.eventName} on ${trigger.contractId}`);
-            
+            logger.debug(`Polling for: ${trigger.eventName} on ${trigger.contractId}`);
             try {
                 // Determine our ledger bounds for this trigger
                 let startLedger = trigger.lastPolledLedger;
@@ -35,7 +175,7 @@ async function pollEvents() {
                 } else {
                     // If we've already polled up to or past the network tip, skip
                     if (startLedger >= latestLedgerSequence) continue;
-                    // Usually we want to start from the *next* ledger
+                    // Start from the *next* ledger
                     startLedger += 1;
                 }
 
@@ -43,25 +183,25 @@ async function pollEvents() {
                 const endLedger = Math.min(startLedger + MAX_LEDGERS_PER_POLL, latestLedgerSequence);
 
                 // Convert event name to XDR format for topic filtering
-                // Note: Soroban getEvents expects topics in XDR base64
                 const eventTopicXdr = xdr.ScVal.scvSymbol(trigger.eventName).toXDR("base64");
 
                 let cursor = undefined;
                 let foundEvents = 0;
+                let failedActions = 0;
 
                 // 2. Fetch events with pagination support
                 while (true) {
-                    const response = await server.getEvents({
+                    const response = await withRetry(() => server.getEvents({
                         startLedger,
                         filters: [
                             {
                                 type: "contract",
                                 contractIds: [trigger.contractId],
-                                topics: [ [eventTopicXdr] ]
+                                topics: [[eventTopicXdr]]
                             }
                         ],
                         pagination: { limit: 100, cursor }
-                    });
+                    }));
 
                     // Parse the events
                     if (response && response.events && response.events.length > 0) {
@@ -69,8 +209,21 @@ async function pollEvents() {
                             // Ensure the event falls within our intended window
                             if (event.ledger <= endLedger) {
                                 foundEvents++;
-                                // NOTE: Here we would typically dispatch to Webhook/Discord/etc.
-                                // e.g. await axios.post(trigger.actionUrl, { eventData: event.value })
+                                const result = await executeWithRetry(trigger, event);
+
+                                // Track execution stats
+                                trigger.totalExecutions = (trigger.totalExecutions || 0) + 1;
+                                if (result.success) {
+                                    trigger.lastSuccessAt = new Date();
+                                } else {
+                                    trigger.failedExecutions = (trigger.failedExecutions || 0) + 1;
+                                    failedActions++;
+                                    logger.error(`Action permanently failed for trigger ${trigger._id}`, {
+                                        error: result.error?.message,
+                                        actionType: trigger.actionType,
+                                        eventLedger: event.ledger,
+                                    });
+                                }
                             }
                         }
 
@@ -85,8 +238,8 @@ async function pollEvents() {
                         break;
                     }
 
-                    // Optional short sleep between pages to avoid immediately tripping rate limits
-                    await new Promise(resolve => setTimeout(resolve, 200));
+                    // Sleep between pages to avoid tripping rate limits
+                    await sleep(INTER_PAGE_DELAY_MS);
                 }
 
                 // 3. Update trigger state
@@ -94,23 +247,52 @@ async function pollEvents() {
                 await trigger.save();
 
                 if (foundEvents > 0) {
-                    console.log(`✅ Collected ${foundEvents} events for trigger ${trigger._id}`);
+                    logger.info(`Collected events for trigger`, {
+                        triggerId: trigger._id,
+                        foundEvents,
+                        failedActions,
+                    });
                 }
 
             } catch (triggerError) {
-                console.error(`❌ Error processing trigger ${trigger._id}:`, triggerError.message);
+                logger.error(`Error processing trigger ${trigger._id}:`, { triggerError: triggerError.message });
                 // On failure, we skip updating lastPolledLedger so it will retry on the next interval
             }
+
+            // Small delay between triggers to spread RPC load
+            await sleep(INTER_TRIGGER_DELAY_MS);
         }
+
+        logger.info('Event polling cycle completed', {
+            processedTriggers: triggers.length
+        });
     } catch (error) {
-        console.error('❌ Error in poller loop:', error);
+        logger.error('Error in event poller', {
+            error: error.message,
+            stack: error.stack,
+            rpcUrl: RPC_URL
+        });
     }
 }
 
 function start() {
-    const intervalMs = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
-    setInterval(pollEvents, intervalMs);
-    console.log(`🤖 Event poller worker started (interval: ${intervalMs}ms)`);
+    const pollInterval = process.env.POLL_INTERVAL_MS || 10000;
+
+    logger.info('Event poller worker starting', {
+        pollInterval: pollInterval,
+        rpcUrl: RPC_URL,
+        maxLedgersPerPoll: MAX_LEDGERS_PER_POLL,
+        rpcMaxRetries: RPC_MAX_RETRIES,
+    });
+
+    setInterval(pollEvents, pollInterval);
+
+    logger.info('Event poller worker started successfully', {
+        intervalMs: pollInterval
+    });
 }
 
-module.exports = { start };
+module.exports = {
+    start,
+    executeTriggerAction,
+};
